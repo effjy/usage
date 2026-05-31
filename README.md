@@ -13,7 +13,7 @@ A real-time network traffic and bandwidth monitoring tool written in C and built
 ## 📸 Screenshot
 
 <div align="center">
-  <img src="screenshot.png" alt="Usage Network Traffic Monitor - Main Interface" width="800"/>
+  <img src="screenshot.png" alt="Usage Network Traffic Monitor - Main Interface" width="500"/>
   <br/>
   <em>Live bandwidth graph, real-time speeds, and session statistics — styled with Tokyo Night</em>
 </div>
