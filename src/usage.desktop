@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Usage
+Comment=Real-time Internet Usage Monitor
+Exec=usage
+Icon=usage
+Terminal=false
+Type=Application
+Categories=Network;Monitor;System;GTK;
+StartupNotify=true
+Keywords=network;internet;speed;traffic;bandwidth;monitor;
