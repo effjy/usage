@@ -1,6 +1,14 @@
 # Usage (Network Traffic Monitor)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![C Standard: C11](https://img.shields.io/badge/C-C11-blue.svg)](#)
+[![Platform: Linux](https://img.shields.io/badge/Platform-Linux-orange.svg)](#)
+[![GTK Version: 3.0](https://img.shields.io/badge/GTK-3.0-brightgreen.svg)](#)
+[![UI Theme: Tokyo Night](https://img.shields.io/badge/UI%20Theme-Tokyo%20Night-purple.svg)](#)
+
 A real-time network traffic and bandwidth monitoring tool written in C and built with GTK+ 3. It displays current speeds, records session statistics, and draws a live graph of incoming and outgoing traffic. The interface is styled with a premium Tokyo Night dark theme.
+
+---
 
 ## Features
 
@@ -74,4 +82,9 @@ To remove the application from your system:
 ```bash
 # Uninstall system-wide (requires root/sudo permissions)
 sudo make uninstall
+```
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 ```
