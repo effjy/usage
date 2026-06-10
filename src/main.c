@@ -222,20 +222,66 @@ int get_interface_stats(const char *target_iface, unsigned long long *rx_bytes, 
     return found;
 }
 
+// Rounded-rectangle helper for clipping the plot area
+static void rounded_rect(cairo_t *cr, double x, double y, double w, double h, double r) {
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, x + w - r, y + r,     r, -G_PI / 2, 0);
+    cairo_arc(cr, x + w - r, y + h - r, r, 0,          G_PI / 2);
+    cairo_arc(cr, x + r,     y + h - r, r, G_PI / 2,   G_PI);
+    cairo_arc(cr, x + r,     y + r,     r, G_PI,       3 * G_PI / 2);
+    cairo_close_path(cr);
+}
+
+// Trace a smooth (Catmull-Rom -> cubic Bezier) curve through the series, then
+// drop down to the baseline so the shape can be filled.
+static void build_smooth_area(cairo_t *cr, const double *series, int len,
+                              double dx, double max_speed, int height) {
+    double px[HISTORY_MAX], py[HISTORY_MAX];
+    if (len < 2) return;
+    for (int i = 0; i < len; i++) {
+        px[i] = i * dx;
+        double y = height - (series[i] / max_speed) * height;
+        if (y < 1.5) y = 1.5;
+        if (y > height) y = height;
+        py[i] = y;
+    }
+
+    cairo_move_to(cr, px[0], (double)height);
+    cairo_line_to(cr, px[0], py[0]);
+    for (int i = 0; i < len - 1; i++) {
+        double x0 = px[i > 0 ? i - 1 : i],     y0 = py[i > 0 ? i - 1 : i];
+        double x1 = px[i],                      y1 = py[i];
+        double x2 = px[i + 1],                  y2 = py[i + 1];
+        double x3 = px[i + 2 < len ? i + 2 : i + 1], y3 = py[i + 2 < len ? i + 2 : i + 1];
+        double c1x = x1 + (x2 - x0) / 6.0, c1y = y1 + (y2 - y0) / 6.0;
+        double c2x = x2 - (x3 - x1) / 6.0, c2y = y2 - (y3 - y1) / 6.0;
+        cairo_curve_to(cr, c1x, c1y, c2x, c2y, x2, y2);
+    }
+    cairo_line_to(cr, px[len - 1], (double)height);
+    cairo_close_path(cr);
+}
+
 // Cairo draw callback for speed graph
 gboolean on_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
     AppState *state = (AppState *)data;
     int width = gtk_widget_get_allocated_width(widget);
     int height = gtk_widget_get_allocated_height(widget);
 
-    // Draw background - Tokyo Night / Dark crust color
-    cairo_set_source_rgb(cr, 0.08, 0.09, 0.13);
-    cairo_paint(cr);
+    // Rounded clip so the plot reads as an inset panel
+    rounded_rect(cr, 0.5, 0.5, width - 1.0, height - 1.0, 12.0);
+    cairo_clip_preserve(cr);
 
-    // Draw background Grid lines
-    cairo_set_source_rgba(cr, 0.25, 0.28, 0.41, 0.3); // transparent grid lines
+    // Deep gradient backdrop
+    cairo_pattern_t *bg = cairo_pattern_create_linear(0, 0, 0, height);
+    cairo_pattern_add_color_stop_rgb(bg, 0.0, 0.066, 0.072, 0.105);
+    cairo_pattern_add_color_stop_rgb(bg, 1.0, 0.043, 0.047, 0.078);
+    cairo_set_source(cr, bg);
+    cairo_paint(cr);
+    cairo_pattern_destroy(bg);
+
+    // Grid lines
+    cairo_set_source_rgba(cr, 0.32, 0.36, 0.52, 0.22);
     cairo_set_line_width(cr, 1.0);
-    
     int grid_rows = 4;
     for (int i = 1; i < grid_rows; i++) {
         double y = (height / (double)grid_rows) * i;
@@ -243,7 +289,6 @@ gboolean on_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
         cairo_line_to(cr, width, y);
         cairo_stroke(cr);
     }
-    
     int grid_cols = 6;
     for (int i = 1; i < grid_cols; i++) {
         double x = (width / (double)grid_cols) * i;
@@ -260,72 +305,70 @@ gboolean on_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
     }
     max_speed *= 1.15; // 15% head room
 
-    // Dynamic grid scale text
+    // Scale labels: top, midpoint, baseline
     cairo_select_font_face(cr, "Inter", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr, 10.0);
-    cairo_set_source_rgb(cr, 0.45, 0.47, 0.58);
-    
-    char max_speed_str[32];
-    format_speed(max_speed, max_speed_str, sizeof(max_speed_str));
-    cairo_move_to(cr, 8, 16);
-    cairo_show_text(cr, max_speed_str);
-
-    cairo_move_to(cr, 8, height - 8);
-    cairo_show_text(cr, "0.0 B/s");
+    char scale_str[32];
+    cairo_set_source_rgba(cr, 0.55, 0.58, 0.72, 0.9);
+    format_speed(max_speed, scale_str, sizeof(scale_str));
+    cairo_move_to(cr, 10, 16); cairo_show_text(cr, scale_str);
+    format_speed(max_speed / 2.0, scale_str, sizeof(scale_str));
+    cairo_move_to(cr, 10, height / 2.0 + 4); cairo_show_text(cr, scale_str);
+    cairo_move_to(cr, 10, height - 9); cairo_show_text(cr, "0.0 B/s");
 
     double dx = width / (double)(HISTORY_MAX - 1);
 
-    // Draw Download Area & Path (Green #9ece6a)
     if (state->history_len > 1) {
-        // Download shape
-        cairo_move_to(cr, 0, height);
-        for (int i = 0; i < state->history_len; i++) {
-            double x = i * dx;
-            double y = height - (state->rx_history[i] / max_speed) * height;
-            if (y < 0) y = 0;
-            if (y > height) y = height;
-            cairo_line_to(cr, x, y);
+        struct { const double *series; double r, g, b; } layers[2] = {
+            { state->tx_history, 0.97, 0.46, 0.56 }, // upload  #f7768e (drawn first)
+            { state->rx_history, 0.62, 0.81, 0.42 }, // download #9ece6a (on top)
+        };
+
+        for (int L = 0; L < 2; L++) {
+            double r = layers[L].r, g = layers[L].g, b = layers[L].b;
+
+            // Filled area with vertical gradient
+            build_smooth_area(cr, layers[L].series, state->history_len, dx, max_speed, height);
+            cairo_pattern_t *fill = cairo_pattern_create_linear(0, 0, 0, height);
+            cairo_pattern_add_color_stop_rgba(fill, 0.0, r, g, b, 0.32);
+            cairo_pattern_add_color_stop_rgba(fill, 1.0, r, g, b, 0.0);
+            cairo_set_source(cr, fill);
+            cairo_fill(cr);
+            cairo_pattern_destroy(fill);
+
+            // Re-trace just the top edge for the stroked line
+            build_smooth_area(cr, layers[L].series, state->history_len, dx, max_speed, height);
+
+            // Outer glow pass
+            cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+            cairo_set_source_rgba(cr, r, g, b, 0.30);
+            cairo_set_line_width(cr, 6.0);
+            cairo_stroke_preserve(cr);
+
+            // Crisp neon line
+            cairo_set_source_rgb(cr, r, g, b);
+            cairo_set_line_width(cr, 2.0);
+            cairo_stroke(cr);
+
+            // Glowing dot on the most recent sample
+            int last = state->history_len - 1;
+            double lx = last * dx;
+            double ly = height - (layers[L].series[last] / max_speed) * height;
+            if (ly < 1.5) ly = 1.5;
+            if (ly > height) ly = height;
+            cairo_set_source_rgba(cr, r, g, b, 0.25);
+            cairo_arc(cr, lx, ly, 5.0, 0, 2 * G_PI); cairo_fill(cr);
+            cairo_set_source_rgb(cr, r, g, b);
+            cairo_arc(cr, lx, ly, 2.5, 0, 2 * G_PI); cairo_fill(cr);
         }
-        cairo_line_to(cr, (state->history_len - 1) * dx, height);
-        cairo_close_path(cr);
-
-        // Fill with vertical gradient
-        cairo_pattern_t *pat_rx = cairo_pattern_create_linear(0, 0, 0, height);
-        cairo_pattern_add_color_stop_rgba(pat_rx, 0.0, 0.62, 0.81, 0.42, 0.25); // #9ece6a with opacity
-        cairo_pattern_add_color_stop_rgba(pat_rx, 1.0, 0.62, 0.81, 0.42, 0.0);
-        cairo_set_source(cr, pat_rx);
-        cairo_fill_preserve(cr);
-        cairo_pattern_destroy(pat_rx);
-
-        // Stroke line
-        cairo_set_source_rgb(cr, 0.62, 0.81, 0.42); // #9ece6a
-        cairo_set_line_width(cr, 2.0);
-        cairo_stroke(cr);
-
-        // Draw Upload Area & Path (Pink/Red #f7768e)
-        cairo_move_to(cr, 0, height);
-        for (int i = 0; i < state->history_len; i++) {
-            double x = i * dx;
-            double y = height - (state->tx_history[i] / max_speed) * height;
-            if (y < 0) y = 0;
-            if (y > height) y = height;
-            cairo_line_to(cr, x, y);
-        }
-        cairo_line_to(cr, (state->history_len - 1) * dx, height);
-        cairo_close_path(cr);
-
-        // Fill with vertical gradient
-        cairo_pattern_t *pat_tx = cairo_pattern_create_linear(0, 0, 0, height);
-        cairo_pattern_add_color_stop_rgba(pat_tx, 0.0, 0.97, 0.46, 0.56, 0.22); // #f7768e with opacity
-        cairo_pattern_add_color_stop_rgba(pat_tx, 1.0, 0.97, 0.46, 0.56, 0.0);
-        cairo_set_source(cr, pat_tx);
-        cairo_fill_preserve(cr);
-        cairo_pattern_destroy(pat_tx);
-
-        // Stroke line
-        cairo_set_source_rgb(cr, 0.97, 0.46, 0.56); // #f7768e
-        cairo_stroke(cr);
     }
+
+    // Subtle vignette + crisp rounded border to finish the frame
+    cairo_reset_clip(cr);
+    rounded_rect(cr, 0.5, 0.5, width - 1.0, height - 1.0, 12.0);
+    cairo_set_source_rgba(cr, 0.48, 0.55, 0.86, 0.35);
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
 
     return FALSE;
 }
@@ -1031,27 +1074,83 @@ int main(int argc, char *argv[]) {
 
     // Apply custom Tokyo Night themed stylesheet
     GtkCssProvider *css_provider = gtk_css_provider_new();
-    const char *css = 
-        "window { background-color: #1a1b26; color: #a9b1d6; font-family: 'Inter', sans-serif; }\n"
-        ".main-container { padding: 16px; }\n"
-        ".card { background-color: #24283b; border: 1px solid #414868; border-radius: 10px; padding: 18px; }\n"
-        ".stat-title { font-size: 11px; font-weight: bold; color: #565f89; letter-spacing: 0.8px; }\n"
-        ".stat-val { font-size: 28px; font-weight: bold; margin-top: 6px; margin-bottom: 6px; }\n"
-        ".stat-val-in { color: #9ece6a; }\n"
-        ".stat-val-out { color: #f7768e; }\n"
-        ".stat-val-limit { color: #ff9e64; }\n"
-        ".stat-val-limit-exceeded { color: #f7768e; }\n"
-        ".stat-sub { font-size: 12px; color: #787c99; font-weight: 500; }\n"
-        ".graph-title { font-size: 12px; font-weight: bold; color: #7aa2f7; letter-spacing: 0.5px; margin-bottom: 8px; }\n"
-        ".grid-label-title { font-size: 11px; font-weight: bold; color: #565f89; letter-spacing: 0.5px; }\n"
-        ".grid-label-val { font-size: 14px; font-weight: bold; color: #c0caf5; }\n"
-        "headerbar { background: linear-gradient(to bottom, #24283b, #1f2335); border-bottom: 1px solid #414868; padding: 8px; }\n"
-        "headerbar .title { font-weight: bold; color: #c0caf5; }\n"
-        "headerbar .subtitle { color: #7aa2f7; }\n"
-        "combobox { background-color: #24283b; border: 1px solid #414868; color: #c0caf5; border-radius: 6px; padding: 2px 6px; }\n"
+    const char *css =
+        /* ---- Aurora · Tokyo Night Storm ---------------------------------- */
+        "window {"
+        "  background-image: radial-gradient(circle at 12% -8%, #2a2f45 0%, #1a1b26 42%),"
+        "                    radial-gradient(circle at 110% 120%, #232a47 0%, rgba(26,27,38,0) 55%);"
+        "  background-color: #16161e;"
+        "  color: #a9b1d6;"
+        "  font-family: 'Inter', 'Cantarell', sans-serif;"
+        "}\n"
+        ".main-container { padding: 18px; }\n"
+
+        /* Glass cards with a soft inner highlight and depth shadow */
+        ".card {"
+        "  background-image: linear-gradient(145deg, rgba(41,46,66,0.96), rgba(31,35,53,0.96));"
+        "  border: 1px solid rgba(122,162,247,0.16);"
+        "  border-radius: 14px;"
+        "  padding: 18px;"
+        "  box-shadow: 0 8px 24px rgba(0,0,0,0.35);"
+        "}\n"
+        /* Color-coded accent edge per metric card */
+        ".card-in    { border-left: 3px solid #9ece6a; }\n"
+        ".card-out   { border-left: 3px solid #f7768e; }\n"
+        ".card-limit { border-left: 3px solid #ff9e64; }\n"
+
+        ".stat-title {"
+        "  font-size: 11px; font-weight: 800; color: #6b74a0;"
+        "  letter-spacing: 1.4px;"
+        "}\n"
+        ".stat-val {"
+        "  font-size: 30px; font-weight: 800;"
+        "  margin-top: 4px; margin-bottom: 4px;"
+        "  text-shadow: 0 0 18px rgba(122,162,247,0.28);"
+        "}\n"
+        ".stat-val-in            { color: #9ece6a; text-shadow: 0 0 20px rgba(158,206,106,0.45); }\n"
+        ".stat-val-out           { color: #f7768e; text-shadow: 0 0 20px rgba(247,118,142,0.45); }\n"
+        ".stat-val-limit         { color: #ff9e64; text-shadow: 0 0 20px rgba(255,158,100,0.45); }\n"
+        ".stat-val-limit-exceeded{ color: #f7768e; text-shadow: 0 0 22px rgba(247,118,142,0.65); }\n"
+        ".stat-sub { font-size: 12px; color: #7e85ad; font-weight: 600; }\n"
+
+        ".graph-title {"
+        "  font-size: 12px; font-weight: 800; color: #7aa2f7;"
+        "  letter-spacing: 1.6px; margin-bottom: 8px;"
+        "}\n"
+        ".grid-label-title { font-size: 11px; font-weight: 800; color: #6b74a0; letter-spacing: 1px; }\n"
+        ".grid-label-val   { font-size: 15px; font-weight: 700; color: #c0caf5; }\n"
+
+        "headerbar {"
+        "  background-image: linear-gradient(to bottom, #2a2f45, #1d2030);"
+        "  border-bottom: 1px solid rgba(122,162,247,0.25);"
+        "  box-shadow: 0 2px 12px rgba(0,0,0,0.4);"
+        "  padding: 8px 10px;"
+        "}\n"
+        "headerbar .title { font-weight: 800; color: #c0caf5; letter-spacing: 0.4px; }\n"
+        "headerbar .subtitle { color: #7aa2f7; font-weight: 600; }\n"
+
+        "combobox {"
+        "  background-image: linear-gradient(145deg, #2a2f45, #24283b);"
+        "  border: 1px solid rgba(122,162,247,0.28); color: #c0caf5;"
+        "  border-radius: 9px; padding: 2px 6px;"
+        "}\n"
+        "combobox:hover { border-color: #7aa2f7; }\n"
         "combobox button { background: none; border: none; box-shadow: none; color: #c0caf5; }\n"
-        "button { background: #24283b; border: 1px solid #414868; color: #c0caf5; border-radius: 6px; }\n"
-        "button:hover { background: #414868; border-color: #7aa2f7; }\n";
+
+        "button {"
+        "  background-image: linear-gradient(145deg, #2a2f45, #24283b);"
+        "  border: 1px solid rgba(122,162,247,0.28); color: #c0caf5;"
+        "  border-radius: 9px; padding: 4px 10px;"
+        "  transition: all 160ms ease;"
+        "}\n"
+        "button:hover {"
+        "  background-image: linear-gradient(145deg, #7aa2f7, #5a7fe0);"
+        "  border-color: #7aa2f7; color: #16161e;"
+        "  box-shadow: 0 0 16px rgba(122,162,247,0.5);"
+        "}\n"
+        "menu, .menu { background-color: #1f2335; border: 1px solid #414868; border-radius: 8px; }\n"
+        "menuitem:hover { background-color: #7aa2f7; color: #16161e; }\n"
+        "tooltip { background-color: #1f2335; color: #c0caf5; border: 1px solid #414868; }\n";
 
     gtk_css_provider_load_from_data(css_provider, css, -1, NULL);
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),
@@ -1062,8 +1161,30 @@ int main(int argc, char *argv[]) {
     // Create primary window
     state->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(state->window), "Usage");
-    gtk_window_set_default_size(GTK_WINDOW(state->window), 680, 520);
+    gtk_window_set_default_size(GTK_WINDOW(state->window), 680, 500);
     g_signal_connect(state->window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+
+    // Start horizontally centered, flush against the top of the screen
+    {
+        GdkDisplay *disp = gdk_display_get_default();
+        GdkMonitor *mon = disp ? gdk_display_get_primary_monitor(disp) : NULL;
+        if (!mon && disp) mon = gdk_display_get_monitor(disp, 0);
+        if (mon) {
+            GdkRectangle geo;
+            gdk_monitor_get_workarea(mon, &geo);
+            int win_w = 680, win_h = 500;
+            gtk_window_get_default_size(GTK_WINDOW(state->window), &win_w, &win_h);
+            // Cap height at 500px and clamp to the usable work area so the
+            // window never spills off-screen
+            if (win_h > 500) win_h = 500;
+            if (win_w > geo.width)  win_w = geo.width;
+            if (win_h > geo.height) win_h = geo.height;
+            gtk_window_set_default_size(GTK_WINDOW(state->window), win_w, win_h);
+            int x = geo.x + (geo.width - win_w) / 2;
+            if (x < geo.x) x = geo.x;
+            gtk_window_move(GTK_WINDOW(state->window), x, geo.y);
+        }
+    }
 
     // Set application icons
     GError *icon_err = NULL;
@@ -1076,7 +1197,7 @@ int main(int argc, char *argv[]) {
     GtkWidget *headerbar = gtk_header_bar_new();
     gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(headerbar), TRUE);
     gtk_header_bar_set_title(GTK_HEADER_BAR(headerbar), "Usage");
-    gtk_header_bar_set_subtitle(GTK_HEADER_BAR(headerbar), "Internet Traffic Monitor");
+    gtk_header_bar_set_subtitle(GTK_HEADER_BAR(headerbar), "Live Bandwidth · Aurora");
     gtk_window_set_titlebar(GTK_WINDOW(state->window), headerbar);
 
     // Dropdown to select network interfaces
@@ -1157,6 +1278,7 @@ int main(int argc, char *argv[]) {
     // Download Speed Card
     GtkWidget *card_rx = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     gtk_style_context_add_class(gtk_widget_get_style_context(card_rx), "card");
+    gtk_style_context_add_class(gtk_widget_get_style_context(card_rx), "card-in");
     gtk_box_pack_start(GTK_BOX(cards_box), card_rx, TRUE, TRUE, 0);
 
     GtkWidget *lbl_rx_title = gtk_label_new("DOWNLOAD SPEED");
@@ -1178,6 +1300,7 @@ int main(int argc, char *argv[]) {
     // Upload Speed Card
     GtkWidget *card_tx = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     gtk_style_context_add_class(gtk_widget_get_style_context(card_tx), "card");
+    gtk_style_context_add_class(gtk_widget_get_style_context(card_tx), "card-out");
     gtk_box_pack_start(GTK_BOX(cards_box), card_tx, TRUE, TRUE, 0);
 
     GtkWidget *lbl_tx_title = gtk_label_new("UPLOAD SPEED");
@@ -1199,6 +1322,7 @@ int main(int argc, char *argv[]) {
     // Limit Card
     state->card_limit = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     gtk_style_context_add_class(gtk_widget_get_style_context(state->card_limit), "card");
+    gtk_style_context_add_class(gtk_widget_get_style_context(state->card_limit), "card-limit");
     gtk_box_pack_start(GTK_BOX(cards_box), state->card_limit, TRUE, TRUE, 0);
 
     GtkWidget *lbl_limit_title = gtk_label_new("LIMIT REMAINING");
@@ -1235,7 +1359,7 @@ int main(int argc, char *argv[]) {
     gtk_box_pack_start(GTK_BOX(graph_card), lbl_graph_title, FALSE, FALSE, 0);
 
     state->drawing_area = gtk_drawing_area_new();
-    gtk_widget_set_size_request(state->drawing_area, -1, 180);
+    gtk_widget_set_size_request(state->drawing_area, -1, 120);
     g_signal_connect(G_OBJECT(state->drawing_area), "draw", G_CALLBACK(on_draw), state);
     gtk_box_pack_start(GTK_BOX(graph_card), state->drawing_area, TRUE, TRUE, 0);
 
