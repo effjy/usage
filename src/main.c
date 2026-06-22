@@ -99,10 +99,15 @@ typedef struct {
     unsigned long long last_tick_rx;
     unsigned long long last_tick_tx;
     gboolean last_tick_valid;
+
+    // Crash-resilient persistence
+    time_t session_start_wall;   // wall-clock start, used for report duration
+    double last_journal_save;    // monotonic seconds of last journal write
 } AppState;
 
 void play_alarm_sound(void);
 void on_set_limit_activated(GtkMenuItem *item, gpointer user_data);
+static void save_session_journal(AppState *state);
 
 // Format speed value in bytes/s to human readable
 void format_speed(double bytes_per_sec, char *buf, size_t buf_size) {
@@ -573,6 +578,12 @@ gboolean on_timer_tick(gpointer user_data) {
     // Queue draw to update the drawing area
     gtk_widget_queue_draw(state->drawing_area);
 
+    // Mirror the session to disk so a crash loses at most a few seconds of data.
+    if (current_time - state->last_journal_save >= 5.0) {
+        save_session_journal(state);
+        state->last_journal_save = current_time;
+    }
+
     return TRUE;
 }
 
@@ -639,6 +650,181 @@ void save_limit(unsigned long long limit) {
     }
     g_free(config_path);
     g_free(config_file);
+}
+
+// ---- Crash-resilient session journal --------------------------------------
+// The live session statistics are mirrored to a small file on disk so that an
+// unexpected termination never loses accumulated data. The file is rewritten
+// atomically (temp file + rename) and is removed on a clean exit; if it is
+// still present at the next launch it means the previous run crashed, and the
+// data is recovered.
+
+static char *journal_path(void) {
+    const char *config_dir = g_get_user_config_dir();
+    char *dir = g_build_filename(config_dir, "usage", NULL);
+    g_mkdir_with_parents(dir, 0755);
+    char *path = g_build_filename(dir, "session.journal", NULL);
+    g_free(dir);
+    return path;
+}
+
+static void write_snap_list(FILE *fp, const char *tag, GList *list) {
+    for (GList *l = list; l != NULL; l = l->next) {
+        StatSnapshot *s = (StatSnapshot *)l->data;
+        char ts[32];
+        g_strlcpy(ts, s->time_str, sizeof(ts));
+        for (char *p = ts; *p; p++) if (*p == ' ') *p = 'T'; // keep one token
+        fprintf(fp, "%s %s %s %llu %llu %.6f %.6f %.6f %.6f\n",
+                tag, ts, s->interface[0] ? s->interface : "-",
+                s->rx_bytes, s->tx_bytes,
+                s->peak_rx, s->peak_tx, s->avg_rx, s->avg_tx);
+    }
+}
+
+static void write_intv(FILE *fp, const char *tag, IntervalState *iv, double now) {
+    double elapsed = now - iv->start_time;
+    if (elapsed < 0.0) elapsed = 0.0;
+    fprintf(fp, "%s %llu %llu %.6f %.6f %.6f %.6f %lu %.6f\n",
+            tag, iv->rx_bytes, iv->tx_bytes, iv->peak_rx, iv->peak_tx,
+            iv->sum_rx, iv->sum_tx, iv->tick_count, elapsed);
+}
+
+static void save_session_journal(AppState *state) {
+    char *path = journal_path();
+    char *tmp = g_strdup_printf("%s.tmp", path);
+    FILE *fp = fopen(tmp, "w");
+    if (!fp) { g_free(tmp); g_free(path); return; }
+
+    double now = g_get_monotonic_time() / 1000000.0;
+
+    fprintf(fp, "USAGE_JOURNAL 1\n");
+    fprintf(fp, "IFACE %s\n", state->current_interface[0] ? state->current_interface : "-");
+    fprintf(fp, "START_WALL %lld\n", (long long)state->session_start_wall);
+    fprintf(fp, "AGG %.6f %.6f %llu %.6f %.6f\n",
+            state->peak_rx_speed, state->peak_tx_speed,
+            state->tick_count, state->sum_rx_speed, state->sum_tx_speed);
+
+    for (GList *l = state->daily_stats; l != NULL; l = l->next) {
+        DailyStat *d = (DailyStat *)l->data;
+        fprintf(fp, "DAILY %s %llu %llu\n", d->date_str, d->rx_bytes, d->tx_bytes);
+    }
+    write_snap_list(fp, "S15", state->snapshots_15);
+    write_snap_list(fp, "S30", state->snapshots_30);
+    write_snap_list(fp, "S60", state->snapshots_60);
+    write_intv(fp, "I15", &state->intv15, now);
+    write_intv(fp, "I30", &state->intv30, now);
+    write_intv(fp, "I60", &state->intv60, now);
+
+    fflush(fp);
+    fclose(fp);
+
+    // Atomic replace: a crash mid-write can never corrupt the live journal.
+    if (rename(tmp, path) != 0) {
+        remove(tmp);
+    }
+    g_free(tmp);
+    g_free(path);
+}
+
+static void delete_session_journal(void) {
+    char *path = journal_path();
+    remove(path);
+    g_free(path);
+}
+
+// Restore a crashed session's statistics, if a journal is present. Called once
+// at startup after the default interface has been selected, so it overrides the
+// fresh state that interface selection leaves behind.
+static void load_session_journal(AppState *state) {
+    char *path = journal_path();
+    FILE *fp = fopen(path, "r");
+    g_free(path);
+    if (!fp) return;
+
+    char line[512];
+    if (!fgets(line, sizeof(line), fp) || strncmp(line, "USAGE_JOURNAL", 13) != 0) {
+        fclose(fp);
+        return;
+    }
+
+    double now = g_get_monotonic_time() / 1000000.0;
+
+    // Clear anything the initial interface-selection tick may have created so
+    // recovery starts from a clean slate.
+    g_list_free_full(state->daily_stats, g_free); state->daily_stats = NULL;
+    g_list_free_full(state->snapshots_15, g_free); state->snapshots_15 = NULL;
+    g_list_free_full(state->snapshots_30, g_free); state->snapshots_30 = NULL;
+    g_list_free_full(state->snapshots_60, g_free); state->snapshots_60 = NULL;
+    memset(&state->intv15, 0, sizeof(IntervalState)); state->intv15.start_time = now;
+    memset(&state->intv30, 0, sizeof(IntervalState)); state->intv30.start_time = now;
+    memset(&state->intv60, 0, sizeof(IntervalState)); state->intv60.start_time = now;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "START_WALL ", 11) == 0) {
+            long long w = 0;
+            if (sscanf(line + 11, "%lld", &w) == 1 && w > 0) {
+                state->session_start_wall = (time_t)w;
+            }
+        } else if (strncmp(line, "AGG ", 4) == 0) {
+            double prx = 0, ptx = 0, srx = 0, stx = 0;
+            unsigned long long tc = 0;
+            if (sscanf(line + 4, "%lf %lf %llu %lf %lf", &prx, &ptx, &tc, &srx, &stx) == 5) {
+                state->peak_rx_speed = prx;
+                state->peak_tx_speed = ptx;
+                state->tick_count = tc;
+                state->sum_rx_speed = srx;
+                state->sum_tx_speed = stx;
+            }
+        } else if (strncmp(line, "DAILY ", 6) == 0) {
+            char date[16];
+            unsigned long long rx = 0, tx = 0;
+            if (sscanf(line + 6, "%15s %llu %llu", date, &rx, &tx) == 3) {
+                DailyStat *d = g_new0(DailyStat, 1);
+                g_strlcpy(d->date_str, date, sizeof(d->date_str));
+                d->rx_bytes = rx;
+                d->tx_bytes = tx;
+                state->daily_stats = g_list_append(state->daily_stats, d);
+            }
+        } else if (line[0] == 'S' && (line[1] == '1' || line[1] == '3' || line[1] == '6')) {
+            char tag[8], ts[32], iface[32];
+            unsigned long long rx = 0, tx = 0;
+            double prx = 0, ptx = 0, arx = 0, atx = 0;
+            if (sscanf(line, "%7s %31s %31s %llu %llu %lf %lf %lf %lf",
+                       tag, ts, iface, &rx, &tx, &prx, &ptx, &arx, &atx) == 9) {
+                StatSnapshot *s = g_new0(StatSnapshot, 1);
+                for (char *p = ts; *p; p++) if (*p == 'T') *p = ' ';
+                g_strlcpy(s->time_str, ts, sizeof(s->time_str));
+                g_strlcpy(s->interface, iface, sizeof(s->interface));
+                s->rx_bytes = rx; s->tx_bytes = tx;
+                s->peak_rx = prx; s->peak_tx = ptx;
+                s->avg_rx = arx; s->avg_tx = atx;
+                if (strcmp(tag, "S15") == 0)      state->snapshots_15 = g_list_append(state->snapshots_15, s);
+                else if (strcmp(tag, "S30") == 0) state->snapshots_30 = g_list_append(state->snapshots_30, s);
+                else if (strcmp(tag, "S60") == 0) state->snapshots_60 = g_list_append(state->snapshots_60, s);
+                else g_free(s);
+            }
+        } else if (line[0] == 'I' && (line[1] == '1' || line[1] == '3' || line[1] == '6')) {
+            char tag[8];
+            unsigned long long rx = 0, tx = 0;
+            unsigned long tc = 0;
+            double prx = 0, ptx = 0, srx = 0, stx = 0, elapsed = 0;
+            if (sscanf(line, "%7s %llu %llu %lf %lf %lf %lf %lu %lf",
+                       tag, &rx, &tx, &prx, &ptx, &srx, &stx, &tc, &elapsed) == 9) {
+                IntervalState *iv = NULL;
+                if (strcmp(tag, "I15") == 0)      iv = &state->intv15;
+                else if (strcmp(tag, "I30") == 0) iv = &state->intv30;
+                else if (strcmp(tag, "I60") == 0) iv = &state->intv60;
+                if (iv) {
+                    iv->rx_bytes = rx; iv->tx_bytes = tx;
+                    iv->peak_rx = prx; iv->peak_tx = ptx;
+                    iv->sum_rx = srx; iv->sum_tx = stx;
+                    iv->tick_count = tc;
+                    iv->start_time = now - elapsed;
+                }
+            }
+        }
+    }
+    fclose(fp);
 }
 
 // Play alarm sound asynchronously
@@ -779,7 +965,10 @@ void on_about_clicked(GtkMenuItem *item, gpointer user_data) {
 // Escape special LaTeX characters
 void escape_latex(const char *src, char *dest, size_t dest_size) {
     size_t j = 0;
-    for (size_t i = 0; src[i] != '\0' && j < dest_size - 4; i++) {
+    if (dest_size == 0) return;
+    // Reserve enough head-room for the longest expansion (the 15-byte
+    // "\textbackslash{}" sequence) plus the terminating NUL.
+    for (size_t i = 0; src[i] != '\0' && j + 16 < dest_size; i++) {
         if (src[i] == '%' || src[i] == '_' || src[i] == '&' || src[i] == '$' || src[i] == '#' || src[i] == '{' || src[i] == '}') {
             dest[j++] = '\\';
             dest[j++] = src[i];
@@ -850,9 +1039,13 @@ void write_latex_report(AppState *state, const char *filepath) {
     fprintf(fp, "\\section{Executive Summary}\n");
     fprintf(fp, "This report contains the network usage statistics logged by the Usage Monitor program.\n");
     
-    // Overall Stats
-    double current_time = g_get_monotonic_time() / 1000000.0;
-    double duration = current_time - state->selection_time;
+    // Overall Stats. Duration is taken from the wall clock so that it stays
+    // correct across a crash-recovery; totals are summed from the accumulated
+    // daily statistics rather than fragile live-counter arithmetic (which would
+    // break on a counter reset/reboot).
+    time_t now_wall = time(NULL);
+    double duration = (double)(now_wall - state->session_start_wall);
+    if (duration < 0.0) duration = 0.0;
     char dur_buf[64];
     format_duration(duration, dur_buf, sizeof(dur_buf));
 
@@ -862,12 +1055,12 @@ void write_latex_report(AppState *state, const char *filepath) {
     fprintf(fp, "\\begin{itemize}\n");
     fprintf(fp, "  \\item \\textbf{Monitored Interface:} %s\n", iface_escaped);
     fprintf(fp, "  \\item \\textbf{Total Duration:} %s\n", dur_buf);
-    
+
     unsigned long long total_rx = 0, total_tx = 0;
-    unsigned long long current_rx = 0, current_tx = 0;
-    if (get_interface_stats(state->current_interface, &current_rx, &current_tx)) {
-        if (current_rx >= state->initial_rx_bytes) total_rx = current_rx - state->initial_rx_bytes;
-        if (current_tx >= state->initial_tx_bytes) total_tx = current_tx - state->initial_tx_bytes;
+    for (GList *l = state->daily_stats; l != NULL; l = l->next) {
+        DailyStat *d = (DailyStat *)l->data;
+        total_rx += d->rx_bytes;
+        total_tx += d->tx_bytes;
     }
     char rx_buf[64], tx_buf[64], total_buf[64];
     format_size(total_rx, rx_buf, sizeof(rx_buf));
@@ -1060,6 +1253,15 @@ void on_save_stats_clicked(GtkWidget *button, gpointer user_data) {
     gtk_widget_destroy(dialog);
 }
 
+// Clean-exit handler: a deliberate close means the session is over, so the
+// recovery journal is discarded.
+void on_window_destroy(GtkWidget *widget, gpointer user_data) {
+    (void)widget;
+    (void)user_data;
+    delete_session_journal();
+    gtk_main_quit();
+}
+
 int main(int argc, char *argv[]) {
     gtk_init(&argc, &argv);
 
@@ -1067,6 +1269,8 @@ int main(int argc, char *argv[]) {
     state->limit_mb = load_saved_limit();
     state->alarm_triggered = FALSE;
     state->program_start_time = g_get_monotonic_time() / 1000000.0;
+    state->session_start_wall = time(NULL);
+    state->last_journal_save = state->program_start_time;
     state->intv15.start_time = state->program_start_time;
     state->intv30.start_time = state->program_start_time;
     state->intv60.start_time = state->program_start_time;
@@ -1162,7 +1366,7 @@ int main(int argc, char *argv[]) {
     state->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(state->window), "Usage");
     gtk_window_set_default_size(GTK_WINDOW(state->window), 680, 500);
-    g_signal_connect(state->window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+    g_signal_connect(state->window, "destroy", G_CALLBACK(on_window_destroy), state);
 
     // Start horizontally centered, flush against the top of the screen
     {
@@ -1443,6 +1647,10 @@ int main(int argc, char *argv[]) {
     if (iface_count > 0) {
         gtk_combo_box_set_active(GTK_COMBO_BOX(state->combo_iface), default_idx);
     }
+
+    // If a journal survived the previous run (i.e. it crashed), recover its
+    // statistics now, overriding the clean state left by interface selection.
+    load_session_journal(state);
 
     gtk_widget_show_all(state->window);
 
